@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+WORKDIR /app/ui
+COPY ui/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY ui/ .
+ENV PYTHONUNBUFFERED=1 PORT=7860 API_BASE=http://traefik:80
+EXPOSE 7860
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/', timeout=2)"
+CMD ["python", "app.py"]

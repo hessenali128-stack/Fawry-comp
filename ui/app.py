@@ -1,0 +1,173 @@
+"""
+app.py
+------
+Fawry-styled Gradio app wired to the recommendation backend (through Traefik).
+
+  Login / Sign up  -> the identifier becomes the user_id sent to the API
+                      (log in with a customer id such as CUST_0007; sign up creates a cold-start user)
+  Home / Offers    -> live POST /recommendations
+  Offers buttons   -> POST /events (click / open / purchase / redemption), then fresh recommendations
+
+Run with:  python app.py      (env: API_BASE, PORT)
+"""
+import os
+import re
+
+import gradio as gr
+
+import backend as B
+import components as C
+import pages as P
+from theme import CUSTOM_CSS, EXTRA_CSS
+
+APP_PAGES = ["home", "wallet", "offers", "quickpay"]
+PAGE_KEYS = ["login", "signup", "home", "wallet", "offers", "quickpay", "nav"]
+MAX_SLOTS = 10
+N_VIEW = 3 + 2 * MAX_SLOTS  # session, for-you strip, model status, (column, html) per slot
+
+
+def build_app():
+    with gr.Blocks(css=CUSTOM_CSS + EXTRA_CSS, title="Fawry", theme=gr.themes.Base()) as demo:
+        user_name = gr.State("Ahmed Mohamed")
+        session = gr.State({"user_id": None, "recs": []})
+
+        with gr.Column(elem_id="fw-shell"):
+            login = P.build_login_page()
+            signup = P.build_signup_page()
+
+            home = P.build_home_page()
+            wallet = P.build_wallet_page()
+            offers = P.build_offers_page(max_slots=MAX_SLOTS)
+            quickpay = P.build_quickpay_page()
+
+            nav_row, nav_buttons = C.bottom_nav(active="home", visible=False)
+
+        all_page_cols = {
+            "login": login["col"], "signup": signup["col"],
+            "home": home["col"], "wallet": wallet["col"],
+            "offers": offers["col"], "quickpay": quickpay["col"],
+        }
+        slots = offers["slots"]
+        view_outputs = [session, home["for_you_html"], offers["model_status"],
+                        *[c for s in slots for c in (s["col"], s["html"])]]
+
+        # ---- helpers -------------------------------------------------
+        def goto(target):
+            updates = {key: gr.update(visible=(key == target)) for key in all_page_cols}
+            updates["nav"] = gr.update(visible=(target in APP_PAGES))
+            return updates
+
+        def display_name(identifier):
+            ident = identifier.strip()
+            if ident.upper().startswith(("CUST", "USER")):
+                return ident.upper()
+            local_part = ident.split("@")[0] if "@" in ident else ident
+            cleaned = local_part.replace(".", " ").replace("_", " ").replace("-", " ").strip()
+            return cleaned.title() if cleaned else "Fawry User"
+
+        def signup_user_id(phone, email):
+            digits = re.sub(r"\D", "", phone)
+            return f"USER_{digits}" if digits else "USER_" + re.sub(r"[^a-z0-9]+", "_", email.lower()).strip("_")
+
+        def make_router(target):
+            def _router(*_args):
+                upd = goto(target)
+                return [upd[k] for k in PAGE_KEYS]
+            return _router
+
+        outputs = [login["col"], signup["col"], home["col"],
+                   wallet["col"], offers["col"], quickpay["col"], nav_row]
+
+        # ---- live recommendations -----------------------------------------
+        def view_updates(sess, data, err):
+            recs = sess["recs"]
+            upd = [sess,
+                   gr.update(value=C.rec_cards_html(recs) if recs else C.for_you_offers_html()),
+                   gr.update(value=C.status_line(data, err))]
+            for i in range(MAX_SLOTS):
+                if i < len(recs):
+                    upd += [gr.update(visible=True), gr.update(value=C.rec_card_html(recs[i]))]
+                else:
+                    upd += [gr.update(visible=False), gr.update(value="")]
+            return upd
+
+        def fetch(sess):
+            if not sess.get("user_id"):
+                return view_updates(sess, None, "Please log in first.")
+            data, err = B.recommendations(sess["user_id"], MAX_SLOTS)
+            if data:
+                sess["recs"] = data["recommendations"]
+            return view_updates(sess, data, err)
+
+        # ---- auth flow -------------------------------------------------
+        def do_login(identifier, password, sess):
+            ok = bool(identifier and password)
+            if not ok:
+                upd = goto("login")
+                return ["⚠️ Please enter your customer ID / email / phone and password.",
+                        *[upd[k] for k in PAGE_KEYS], gr.skip(), gr.skip(), *[gr.skip()] * N_VIEW]
+            sess = {"user_id": identifier.strip(), "recs": []}
+            name = display_name(identifier)
+            upd = goto("home")
+            return ["✅ Logged in! Redirecting...", *[upd[k] for k in PAGE_KEYS],
+                    gr.update(value=C.app_header_html(name=name)), name, *fetch(sess)]
+
+        def do_signup(name, phone, email, password, sess):
+            ok = all([name, phone, email, password])
+            if not ok:
+                upd = goto("signup")
+                return ["⚠️ Please fill in every field.",
+                        *[upd[k] for k in PAGE_KEYS], gr.skip(), gr.skip(), *[gr.skip()] * N_VIEW]
+            uid = signup_user_id(phone, email)
+            sess = {"user_id": uid, "recs": []}
+            upd = goto("home")
+            return [f"✅ Account created! Your customer ID is {uid}. Redirecting...", *[upd[k] for k in PAGE_KEYS],
+                    gr.update(value=C.app_header_html(name=name)), name, *fetch(sess)]
+
+        login["login_btn"].click(
+            do_login, inputs=[login["email"], login["password"], session],
+            outputs=[login["status"], *outputs, home["header_html"], user_name, *view_outputs], api_name="login")
+        signup["signup_btn"].click(
+            do_signup, inputs=[signup["name"], signup["phone"], signup["email"], signup["password"], session],
+            outputs=[signup["status"], *outputs, home["header_html"], user_name, *view_outputs], api_name="signup")
+        login["to_signup_btn"].click(make_router("signup"), outputs=outputs)
+        signup["to_login_btn"].click(make_router("login"), outputs=outputs)
+
+        # ---- offer interactions -> POST /events ----------------------------
+        def make_event_handler(i, event):
+            def _handler(sess):
+                recs = sess.get("recs", [])
+                if i >= len(recs):
+                    return ["", *fetch(sess)]
+                rec = recs[i]
+                ok, err = B.send_event(sess["user_id"], rec["offer_id"], event)
+                msg = f"✅ **{event}** sent for `{rec['offer_id']}` - recommendations refreshed." if ok else f"⚠️ {err}"
+                return [msg, *fetch(sess)]
+            return _handler
+
+        event_outputs = [offers["event_status"], *view_outputs]
+        for i, slot in enumerate(slots):
+            for event, btn in slot["buttons"].items():
+                btn.click(make_event_handler(i, event), inputs=[session], outputs=event_outputs,
+                          api_name=f"ev_{i}_{event}")
+        offers["refresh_btn"].click(lambda sess: ["", *fetch(sess)], inputs=[session], outputs=event_outputs,
+                                    api_name="refresh")
+
+        # ---- bottom nav routing -----------------------------------------
+        nav_buttons["home"].click(make_router("home"), outputs=outputs)
+        nav_buttons["wallet"].click(make_router("wallet"), outputs=outputs)
+        nav_buttons["offers"].click(make_router("offers"), outputs=outputs)
+        nav_buttons["quickpay"].click(make_router("quickpay"), outputs=outputs)
+        nav_buttons["more"].click(make_router("wallet"), outputs=outputs)  # demo fallback
+
+        # ---- header shortcut buttons -------------------------------------
+        home["top_up_btn"].click(make_router("wallet"), outputs=outputs)
+        wallet["add_money_btn"].click(make_router("wallet"), outputs=outputs)
+
+    return demo
+
+
+if __name__ == "__main__":
+    demo = build_app()
+    demo.queue(default_concurrency_limit=8)
+    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")), show_api=False)

@@ -1,0 +1,7 @@
+data/*.csv
+models/v*
+loadtest/results
+__pycache__
+*.pyc
+.git
+.devcontainer

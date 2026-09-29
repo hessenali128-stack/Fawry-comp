@@ -1,0 +1,16 @@
+{
+  "name": "fawry-recsys",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": { "cpus": 2, "memory": "8gb", "storage": "32gb" },
+  "forwardPorts": [7860, 8000, 8080, 9100],
+  "portsAttributes": {
+    "7860": { "label": "Fawry UI (Gradio)", "onAutoForward": "openBrowser" },
+    "8000": { "label": "API via Traefik" },
+    "8080": { "label": "Traefik dashboard" },
+    "9100": { "label": "Autoscaler status" }
+  },
+  "postCreateCommand": "pip install --user httpx pandas numpy"
+}

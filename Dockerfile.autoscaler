@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir docker==7.2.0
+COPY autoscaler ./autoscaler
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-m", "autoscaler.autoscaler"]

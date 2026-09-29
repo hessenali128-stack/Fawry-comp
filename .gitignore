@@ -1,0 +1,7 @@
+data/*.csv
+models/v*
+models/current.json
+loadtest/results/
+__pycache__/
+*.pyc
+.env
