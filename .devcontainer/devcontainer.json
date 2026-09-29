@@ -1,16 +1,19 @@
 {
-  "name": "fawry-recsys",
-  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "name": "Fawry RecSys Environment",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "enableNonRootDocker": "true"
+    }
   },
-  "hostRequirements": { "cpus": 2, "memory": "8gb", "storage": "32gb" },
   "forwardPorts": [7860, 8000, 8080, 9100],
-  "portsAttributes": {
-    "7860": { "label": "Fawry UI (Gradio)", "onAutoForward": "openBrowser" },
-    "8000": { "label": "API via Traefik" },
-    "8080": { "label": "Traefik dashboard" },
-    "9100": { "label": "Autoscaler status" }
-  },
-  "postCreateCommand": "pip install --user httpx pandas numpy"
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
 }
