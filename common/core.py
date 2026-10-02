@@ -172,12 +172,12 @@ def ch_f(art: Artifacts, cell: str, seeds: np.ndarray, top_k=60, own_items=None)
 
 
 def retrieve(art: Artifacts, user: dict, live: dict, text_sim_all: np.ndarray,
-             exclude_row=None, own_items=None):
+             exclude_row=None, own_items=None, gov=None):
     """Union of the six channels + how many channels surfaced each candidate.
     exclude_row / own_items are training-only leave-one-out switches (None in serving)."""
     seeds = np.array(sorted(live["seen_idx"]), dtype=int)
     a = ch_a(art, seeds)
-    b = ch_b(art, user["gov"], user["top_cat"])
+    b = ch_b(art, gov or user["gov"], user["top_cat"])
     c = ch_c(art, user["spend_norm"], text_sim_all)
     d = ch_d(art, live["cat_pref"], live["gt_pref"], user["spend_norm"], exclude_row=exclude_row)
     e = ch_e(art, seeds)
@@ -256,14 +256,24 @@ def text_similarity(art: Artifacts, tfidf_profile: np.ndarray) -> np.ndarray:
     return np.clip((art.tfidf_dense @ tfidf_profile) / nrm, 0.0, 1.0).astype(np.float32)
 
 
-def validity_filter(art: Artifacts, cand: np.ndarray, day: int, top_n: int) -> np.ndarray:
-    active = (art.start_day[cand] <= day) & (day <= art.end_day[cand])
-    keep = cand[active]
-    if len(keep) >= top_n:
-        return keep
-    pruned = cand[~active]
-    back = pruned[np.argsort(-art.pop[pruned])][: top_n - len(keep)]
-    return np.concatenate([keep, back])
+def eligible_mask(art: Artifacts, day: int, area) -> np.ndarray:
+    """Serving filters over the whole catalog: offer is active on `day` AND available in `area` (None = any area)."""
+    ok = (art.start_day <= day) & (day <= art.end_day)
+    if area:
+        idx = np.arange(len(art.item_ids))
+        ok &= expanded_geo(art, area, art.gov_tag_idx.get(area, -1), idx) > 0
+    return ok
+
+
+def similar_offers(art: Artifacts, anchor: int, elig: np.ndarray, k: int) -> np.ndarray:
+    """Eligible offers most similar to `anchor`: description TF-IDF cosine + same partner + same category."""
+    sim = 0.5 * (art.tfidf_dense @ art.tfidf_dense[anchor])
+    sim = sim + 0.3 * ((art.offer_partner_idx == art.offer_partner_idx[anchor]) & (art.offer_partner_idx < art.n_partners))
+    sim = sim + 0.2 * (art.offer_cat_idx == art.offer_cat_idx[anchor])
+    sim = np.where(elig, sim, -1.0)
+    sim[anchor] = -1.0
+    top = _topk(sim.astype(np.float32), k)
+    return top[sim[top] > 0]
 
 
 def empty_live(art: Artifacts, user: dict) -> dict:
@@ -281,8 +291,9 @@ def empty_live(art: Artifacts, user: dict) -> dict:
 
 def add_interaction(art: Artifacts, live: dict, item: int, score: float, count: float = 1.0,
                     has_red: float = 0.0, waff: float = 0.0, has_open: float = 0.0, has_purch: float = 0.0):
-    """Fold one (user, offer) interaction row into the live state. Used by training (leave-one-out
-    history) AND serving (Redis state) so both build features from identical semantics."""
+    """Fold one (user, offer) interaction row into the live state. Training and serving share this feature
+    code, but NOT the history window: training uses all the user's other rows (leave-one-out, including later
+    ones); serving only has the events seen so far."""
     live["cat_pref"][art.offer_cat_idx[item]] += score
     p = art.offer_partner_idx[item]
     if p < art.n_partners:
