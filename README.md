@@ -4,7 +4,7 @@ Backend for the v5 hybrid cascade notebook: 6 retrieval channels → LightGBM `L
 with a new **34 → top-17 feature selection** step. Three application services (API, Training, Event Worker)
 plus Redis, PostgreSQL, Traefik, a small autoscaler and the Fawry-style Gradio UI. No Kubernetes, no Kafka.
 
-**Step-by-step operation of every part (GitHub Codespaces, Docker, native): see [`CODESPACES_GUIDE.md`](CODESPACES_GUIDE.md).**
+**Step-by-step operation of every part (GitHub Codespaces, Docker, native): [`CODESPACES_GUIDE.md`](CODESPACES_GUIDE.md) (English) · [`CODESPACES_GUIDE_AR.md`](CODESPACES_GUIDE_AR.md) (عربي + English, RTL).**
 
 ```
 Browser → UI (Gradio :7860) ─┐
@@ -18,10 +18,13 @@ Autoscaler (Docker SDK) watches API containers and adds/removes replicas
 ## 0. Read this first
 
 * **Put your real CSVs in `./data/`** (`user_features.csv`, `train_interactions.csv`, `offer_features.csv`).
-  If the folder is empty, training generates a *synthetic* dataset with the same schema so the stack still runs.
-  It logs a warning; every metric printed on synthetic data is meaningless for your real accuracy.
-* The first `docker compose up` has no model yet: the `training` service bootstraps one (a few minutes).
-  The API answers `503 /ready` until `models/current.json` appears, then loads it automatically.
+  The project never generates data: if a file is missing, `training` logs what is missing and retries every 30 s, so you can
+  upload the files after `docker compose up`. Offers and users come only from these files.
+* The first `docker compose up` has no model yet: once the CSVs are present, the `training` service bootstraps one (a few
+  minutes). The API answers `503 /ready` until `models/current.json` appears, then loads it automatically.
+* **Expiry filter reference date:** `AS_OF_DATE` (default `today`). If every offer in your files has already expired, the API
+  returns an empty list with a `warning` instead of expired offers; set `AS_OF_DATE=dataset` (last day of the logs) or a fixed
+  date such as `2025-06-30` in `docker-compose.yml` for historical data. `GET /areas` shows how many offers are active.
 
 ## 1. Run
 
@@ -36,28 +39,38 @@ Traefik listens on `localhost:8000` (dashboard: `localhost:8080/dashboard/`). Th
 ### UI (`ui/`)
 
 Your Gradio app, same theme and components, now live:
-log in with a customer id (e.g. `CUST_0007`; the password is not checked, as in the original demo) or sign up (creates a
+log in with a customer id from your data (the password is not checked, as in the original demo) or sign up (creates a
 cold-start user `USER_<phone>`). **Home → For you** and **Offers** show real `POST /recommendations` results; each offer has
-**Click / Open / Buy / Redeem** buttons that send `POST /events`, after which the list is regenerated. The status line shows
-model version, cache hit/fresh, latency and which API replica answered (`X-Served-By`). The UI calls the API through Traefik
-(`API_BASE=http://traefik:80`). Wallet and Quick pay pages are unchanged static screens.
+**Click / Open / Buy / Redeem** buttons that send `POST /events`, after which the list is regenerated; the three offers most
+similar to the last interaction are pinned on top (badge *Similar to your last click*). When the page opens the browser asks
+for the device location; it is sent with each request (never stored) and the **Area** selector on the Offers page overrides
+it. The status line shows model version, cache hit/fresh, latency, area and its source, the as-of date, and which API replica
+answered (`X-Served-By`). The UI calls the API through Traefik (`API_BASE=http://traefik:80`). The UI shows no built-in
+sample offers; Wallet, Quick pay and the *Featured* tiles are the original static screens, not data.
 
 ## 2. API usage
 
 ```bash
 curl -X POST localhost:8000/recommendations -H 'content-type: application/json' \
-     -d '{"user_id":"CUST_1234","top_n":10}'
+     -d '{"user_id":"<USER_ID>","top_n":10}'
+
+# optional: where the user is now (area name from GET /areas, or device lat+lon together)
+curl -X POST localhost:8000/recommendations -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","top_n":10,"lat":31.2,"lon":29.95}'
 
 curl -X POST localhost:8000/events -H 'content-type: application/json' \
-     -d '{"user_id":"CUST_1234","offer_id":"OFFER_001","event":"click"}'      # click|open|purchase|redemption
+     -d '{"user_id":"<USER_ID>","offer_id":"<OFFER_ID>","event":"click"}'      # click|open|purchase|redemption
 
 curl localhost:8000/health     # liveness
 curl localhost:8000/ready      # model loaded + Redis reachable
 curl localhost:8000/model      # version, the 17 features, NDCG@10 of the loaded model
+curl localhost:8000/areas      # areas in your data, as-of date, active offers today
 ```
 
-`/recommendations` returns `model_version`, `cached`, and `recommendations[]` (`rank, offer_id, score, source, category`).
-`source` is `model` (LightGBM) or `explore` (the notebook's 20 % exploration slots, used once a user has events).
+`/recommendations` returns `model_version`, `cached`, `area` (`name`, `source` = request / location / profile / none),
+`as_of`, `anchor_offer_id`, an optional `warning`, and `recommendations[]` (`rank, offer_id, score, source, category, …`).
+`source` is `model` (LightGBM), `similar` (pinned, see §3) or `explore` (the notebook's 20 % exploration slots, used once a
+user has events).
 Unknown users are served as cold users (demographic/popularity channels only).
 
 ## 3. Redis cache
@@ -69,8 +82,28 @@ Redis holds exactly two things (plus the event stream):
 | `user:{id}` (hash) | `cat:*`, `partner:*`, `gt:*` preference sums, `offer:{id}` interaction scores (the live TF-IDF profile is computed from these), counters, last event | 30 days |
 | `recommendations:{user_id}` | ranked candidate pools for the current model version | 30 s |
 
-Flow: cache hit → return. Miss → read `user:{id}` → Stage 1 (6 channels) → validity filter → build the 17 features →
-LightGBM → cache → return. No Python dict holds user state, and PostgreSQL is never touched per recommendation request.
+Flow: cache hit → return. Miss → read `user:{id}` → Stage 1 (6 channels) → **filters** → build the 17 features → LightGBM →
+cache → return. The cache is only reused for the same model version, area and as-of day. No Python dict holds user state, and
+PostgreSQL is never touched per recommendation request.
+
+### Serving filters, location and "similar to your click" (production path only; training is unchanged)
+
+1. **Where is the user?** `area` in the request › `lat`+`lon` mapped to the nearest area of your data (farther than
+   `MAX_AREA_KM`=250 km → ignored with a warning) › the governorate in `user_features.csv` › none (no area filter).
+2. **Filters, after retrieval and before the reranker:** keep only offers that are *active on the as-of date*
+   (`gift_start_date ≤ date ≤ gift_end_date`) and *available in the area* (same rule as the `expanded_geo_match` feature:
+   primary governorate, governorate set, or nationwide). They are hard filters: if fewer than `MIN_POOL`=50 candidates
+   survive, the pool is topped up from **eligible** offers only (most popular first), never from expired or out-of-area ones.
+3. **Similar to the last interaction:** the offer of the latest event (within 24 h) is the anchor. The 15 eligible offers most
+   similar to it (description TF-IDF cosine ×0.5 + same partner ×0.3 + same category ×0.2) join the pool, are scored by the
+   ranker like everything else, and the best `SIMILAR_PIN`=3 are pinned to the top. The clicked offer itself is not repeated.
+4. Channel B and the `expanded_geo_match` feature use the current area instead of the profile governorate.
+
+Knobs (env on the `api` service): `AS_OF_DATE`, `MIN_POOL`, `MAX_AREA_KM`, `SIMILAR_PIN` (0 disables pinning), `SIMILAR_POOL`,
+`ANCHOR_MAX_AGE_SECONDS`. The location is used only to pick the area for that request; it is not logged or stored. Area names
+must match the governorate spellings in your files; location→area uses approximate centroids (nearest centroid, not polygons),
+so it is unreliable near borders such as Cairo/Giza/Qalyubia — use the Area selector to correct it. Browsers only expose
+location on HTTPS or `localhost` (a Codespaces forwarded URL is HTTPS).
 
 ## 4. Events
 
@@ -89,7 +122,7 @@ the notebook's raw `score` formula is not in the files, so set it to match your 
 
 ```
 load CSVs (+ production events from PostgreSQL)  →  retrieval artifacts (fit on train users only)
-→ 34-feature query table (leave-one-out history, same code the API uses)  →  LGBMRanker(34)
+→ 34-feature query table (leave-one-out history; features computed by the same code the API uses)  →  LGBMRanker(34)
 → gain importance → top 17 → LGBMRanker(17) → validation gates → save models/vN → publish
 ```
 
@@ -163,6 +196,12 @@ average CPU %, RAM (from the autoscaler's `localhost:9100/status`), and saves a 
   does a dense `train_users × dims` matrix product per request. Fine for the 3,000-user sample; at ~1M customers move
   user static features to Redis/PostgreSQL and replace Channel D's brute force with a batch-built neighbour table.
   Training also builds the query table in RAM (~2.3M rows for 10k queries here) — chunk it at larger scale.
+* **Train/serve history mismatch.** Training builds each user's profile from *all their other rows* (leave-one-out, as in the
+  notebook), which includes interactions that happened **after** the target; serving only knows past events and starts from an
+  empty state. Run `python scripts/leakage_check.py --data data --model` on your real data to measure it (on a development
+  sample: 69 % of warm training queries contained at least one future row, and the shipped model's NDCG@10 was 0.171 with
+  leave-one-out history vs 0.156 with past-only history). A past-only mode exists (`build_query_table(..., history="past")`);
+  the default is unchanged. The 30-day snapshot and spend columns are not time-filtered, and evaluation splits by user, not by time.
 * The UI's login is a placeholder (any non-empty password); there is no real authentication or user registry.
 * The UI layout was verified structurally (it builds, every handler runs, HTML renders) but not visually in a browser.
 * Live state starts empty for every user (as in the notebook's Part 3); pre-go-live history is not replayed.
@@ -172,6 +211,8 @@ average CPU %, RAM (from the autoscaler's `localhost:9100/status`), and saves a 
   (0 can never occur naturally, so the ranker learns "0 ⇒ positive" — a leak); importance is **gain** (the notebook's `feature_importances_` was split-count by default).
 * Worker and live state: the API updates Redis synchronously (so the next request sees the event); the worker does the
   durable PostgreSQL write. The worker does not touch live state again — doing so would double count.
-* `LIVE_DAY_MODE=dataset` (default) uses the dataset's last day as "today", as the notebook does, so offer validity is
-  consistent with the historical data. Use `calendar` only if offer dates are real.
+* Expiry is judged against `AS_OF_DATE` (default: the real date). Training still uses each interaction's own day for
+  `log_days_to_expire`, so with `today` and old offer dates that feature is evaluated outside the range seen in training.
+* The device-location capture is browser JavaScript; the API/UI wiring was tested by sending coordinates through the UI's
+  API, but the browser permission prompt itself was not exercised in a real browser.
 * The autoscaler and Traefik mount `/var/run/docker.sock` (root-equivalent) — acceptable for a demo, not for production.
