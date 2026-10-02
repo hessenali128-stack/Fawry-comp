@@ -229,7 +229,7 @@ def rec_cards_html(recs, limit=6):
 def rec_card_html(rec):
     """One recommended offer on the Offers page (banner style + rank + source badge)."""
     icon, title, sub = _rec_fields(rec)
-    badge = "Explore" if rec.get("source") == "explore" else "Top pick"
+    badge = {"explore": "Explore", "similar": "Similar to your last click"}.get(rec.get("source"), "Top pick")
     return f"""<div class="fw-cashback fw-rec">
           <span class="fw-rec-rank">#{rec['rank']}</span>
           <div class="fw-cashback-icon">{icon}</div>
@@ -238,10 +238,25 @@ def rec_card_html(rec):
           <span class="fw-tag">{badge}</span></div></div>"""
 
 
+_AREA_SRC = {"request": "selected", "location": "device location", "profile": "profile"}
+
+
+def empty_recs_html(text):
+    return f'<div class="fw-status" dir="auto">{_esc(text)}</div>'
+
+
 def status_line(data=None, error=None):
     if error:
         return f'<div class="fw-status">⚠️ {_esc(error)}</div>'
-    served = f" · served by {_esc(data['served_by'])}" if data.get("served_by") else ""
-    cache = "cache hit" if data.get("cached") else "fresh"
-    return (f'<div class="fw-status">Model {_esc(str(data["model_version"]))} · {cache} · '
-            f'{data["latency_ms"]} ms{served}</div>')
+    bits = [f"Model {_esc(str(data['model_version']))}", "cache hit" if data.get("cached") else "fresh",
+            f"{data['latency_ms']} ms"]
+    area = data.get("area") or {}
+    if area.get("name"):
+        bits.append(f"Area: {_esc(area['name'].title())} ({_AREA_SRC.get(area.get('source'), '')})")
+    bits.append(f"as of {_esc(data['as_of'])}")
+    if data.get("served_by"):
+        bits.append(f"served by {_esc(data['served_by'])}")
+    html = f'<div class="fw-status">{" · ".join(bits)}</div>'
+    if data.get("warning"):
+        html += f'<div class="fw-status">⚠️ {_esc(data["warning"])}</div>'
+    return html
