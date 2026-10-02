@@ -43,13 +43,15 @@ PARAMS = dict(objective="lambdarank", metric="ndcg", eval_at=[5, 10], boosting_t
 
 
 # ------------------------------------------------------------------ data
-def ensure_data():
-    d = Path(C.DATA_DIR)
-    if all((d / f).exists() for f in ("user_features.csv", "train_interactions.csv", "offer_features.csv")):
-        return
-    log.warning("No dataset in %s -> generating synthetic data with the notebook's schema", d)
-    from scripts.make_synthetic_data import main as make
-    make(str(d))
+class MissingData(RuntimeError):
+    pass
+
+
+def require_data():
+    need = ("user_features.csv", "train_interactions.csv", "offer_features.csv")
+    missing = [f for f in need if not (Path(C.DATA_DIR) / f).exists()]
+    if missing:
+        raise MissingData(f"missing in {C.DATA_DIR}/: {', '.join(missing)} - add the dataset files, nothing is generated")
 
 
 def events_to_interactions(conn, ti: pd.DataFrame, offers: pd.DataFrame, users: pd.DataFrame) -> pd.DataFrame:
@@ -90,8 +92,9 @@ def grade(r) -> float:
     return 4.0 if r.has_purchase else 2.0 if r.has_investigation else 1.0 if r.has_open else 0.0
 
 
-def build_query_table(art, ti_all: pd.DataFrame, split_of: dict, tr_row: dict):
-    """One query per interaction row; live state = user's OTHER rows (leave-one-out, as in the notebook).
+def build_query_table(art, ti_all: pd.DataFrame, split_of: dict, tr_row: dict, history: str = "loo"):
+    """One query per interaction row. history="loo" (default, as in the notebook): live state = ALL the user's other
+    rows, including later ones. history="past": only rows from strictly earlier days (serving semantics).
     Features come from common.core.build_features - the same function the API calls."""
     X, y, qid, part, cold, hit = [], [], [], [], [], []
     by_user = {u: g.reset_index(drop=True) for u, g in ti_all.groupby("user_id")}
@@ -102,11 +105,13 @@ def build_query_table(art, ti_all: pd.DataFrame, split_of: dict, tr_row: dict):
             continue
         user = art.user_static[u]
         items = g.offer_id.map(art.item_index).to_numpy()
+        day = g.days_since_first_event.to_numpy()
         split = split_of[u]
         for i, r in enumerate(g.itertuples(index=False)):
             tgt = int(items[i])
             live = empty_live(art, user)
-            others = [j for j in range(len(g)) if j != i]
+            others = ([j for j in range(len(g)) if j != i] if history == "loo"
+                      else [j for j in range(len(g)) if day[j] < day[i]])
             for j in others:
                 rj = g.iloc[j]
                 add_interaction(art, live, int(items[j]), float(rj.score), float(rj.interaction_count),
@@ -188,7 +193,7 @@ def evaluate(model, df, cols) -> dict:
 
 # ------------------------------------------------------------------ main pipeline
 def run_training() -> dict:
-    ensure_data()
+    require_data()
     users, ti, offers = load_raw(C.DATA_DIR)
     conn = None
     try:
@@ -324,12 +329,16 @@ def seconds_until_next_run(now: dt.datetime, weekday: int = 6, hour: int = 0) ->
 
 
 def schedule_loop():
-    if registry.read_current() is None:
-        log.info("no production model yet -> bootstrap training")
+    while registry.read_current() is None:  # bootstrap: wait for the dataset files, then train the first model
         try:
+            log.info("no production model yet -> bootstrap training")
             run_training()
+        except MissingData as e:
+            log.error("%s - retrying in 30 s", e)
+            time.sleep(30)
         except Exception:
-            log.exception("bootstrap training failed")
+            log.exception("bootstrap training failed - retrying in 120 s")
+            time.sleep(120)
     while True:
         wait = seconds_until_next_run(dt.datetime.now())
         log.info("next weekly training in %.1f h", wait / 3600)
@@ -348,5 +357,8 @@ if __name__ == "__main__":
     if a.schedule:
         schedule_loop()
     else:
-        res = run_training()
+        try:
+            res = run_training()
+        except MissingData as e:
+            sys.exit(f"ERROR: {e}")
         sys.exit(0 if res["status"] == "ready" else 1)
