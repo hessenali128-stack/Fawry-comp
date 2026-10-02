@@ -18,7 +18,7 @@ def build_login_page():
     with gr.Column(elem_classes="fw-page", visible=True) as col:
         C.auth_shell("Welcome back", "Log in to your Fawry account to continue.")
         with gr.Column(elem_classes="fw-auth-card"):
-            email = gr.Textbox(label="Customer ID, email or phone", placeholder="CUST_0007")
+            email = gr.Textbox(label="Customer ID, email or phone", placeholder="Your customer ID")
             password = gr.Textbox(label="Password", type="password", placeholder="••••••••")
             login_btn = gr.Button("Log in", elem_classes="fw-btn-primary")
             status = gr.Markdown("")
@@ -105,6 +105,8 @@ def build_offers_page(user_name="Ahmed Mohamed", max_slots=10):
     with gr.Column(elem_classes="fw-page", visible=False) as col:
         gr.HTML(C.app_header_html(name=user_name, greeting="Offers for you"))
         gr.HTML(C.search_bar_html("Search offers..."))
+        area_dd = gr.Dropdown(choices=["Auto"], value="Auto", label="Area (Auto = device location, then your profile)",
+                              interactive=True)
         model_status = gr.HTML("")
         event_status = gr.Markdown("")
         refresh_btn = gr.Button("Refresh recommendations", elem_classes="fw-btn-outline", size="sm")
@@ -119,7 +121,7 @@ def build_offers_page(user_name="Ahmed Mohamed", max_slots=10):
             slots.append({"col": slot_col, "html": slot_html, "buttons": btns})
         gr.HTML(C.section_title_html("Featured", see_all=False))
         gr.HTML(C.feature_grid_html())
-    return {"col": col, "model_status": model_status, "event_status": event_status,
+    return {"col": col, "area_dd": area_dd, "model_status": model_status, "event_status": event_status,
             "refresh_btn": refresh_btn, "slots": slots}
 
 
