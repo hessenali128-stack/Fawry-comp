@@ -11,10 +11,11 @@ from typing import Literal
 import numpy as np
 import redis
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from api import config as cfg
 from api.recommender import ModelManager, apply_event, recommend
+from common.core import eligible_mask
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
@@ -53,6 +54,15 @@ async def track(request: Request, call_next):
 class RecReq(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     top_n: int = Field(10, ge=1, le=cfg.MAX_TOP_N)
+    area: str | None = Field(None, max_length=64, description="Current area (governorate); overrides lat/lon")
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def _both_or_neither(self):
+        if (self.lat is None) != (self.lon is None):
+            raise ValueError("lat and lon must be sent together")
+        return self
 
 
 class EventReq(BaseModel):
@@ -67,7 +77,7 @@ def recommendations(req: RecReq):
         raise HTTPException(503, "model not loaded")
     t0 = time.perf_counter()
     try:
-        out = recommend(rds, mgr, req.user_id, req.top_n)
+        out = recommend(rds, mgr, req.user_id, req.top_n, req.area, req.lat, req.lon)
     except redis.RedisError as e:
         raise HTTPException(503, f"redis unavailable: {e}")
     out["user_id"] = req.user_id
@@ -116,6 +126,17 @@ def model():
             "ndcg@10": {"34_features_val": m["val_34"]["ndcg@10"], "17_features_val": m["val_17"]["ndcg@10"],
                         "17_features_test": m["test_17"]["ndcg@10"]},
             "load_error": mgr.last_error, "rejected_version": mgr.failed}
+
+
+@app.get("/areas")
+def areas():
+    b = mgr.bundle
+    if b is None:
+        raise HTTPException(503, "model not loaded")
+    day = b.as_of_day()
+    active = int(eligible_mask(b.art, day, None).sum())
+    return {"areas": b.areas, "mappable_from_location": sorted(b.area_centroids), "as_of": b.as_of_date(day),
+            "as_of_mode": cfg.AS_OF_DATE, "active_offers": active, "total_offers": len(b.art.item_ids)}
 
 
 @app.get("/internal/stats", include_in_schema=False)
