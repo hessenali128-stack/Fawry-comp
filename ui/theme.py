@@ -251,6 +251,7 @@ CUSTOM_CSS = f"""
 
 
 EXTRA_CSS = """
+.fw-hidden { display: none !important; }
 .fw-status { font-size: 11px; color: var(--fw-muted); margin: 0 4px 10px 4px; }
 .fw-rec { position: relative; }
 .fw-rec-rank { position: absolute; top: 8px; right: 12px; font-size: 10px; font-weight: 700; color: var(--fw-muted); }
