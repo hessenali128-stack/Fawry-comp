@@ -5,6 +5,7 @@ networks:
     name: fawry_net
 
 volumes:
+  ui-data:
   redis-data:
   pg-data:
 
@@ -98,6 +99,9 @@ services:
     build: {context: ., dockerfile: Dockerfile.ui}
     environment:
       API_BASE: http://traefik:80     # the UI talks to the API through the load balancer
+      DATA_DIR: /app/ui/data          # accounts + wallet database (persisted)
+      DEMO_PASSWORD: fawry123         # password of the pre-existing (seeded) customers
+    volumes: ["ui-data:/app/ui/data"]
     ports: ["7860:7860"]
     depends_on: [traefik]
     restart: unless-stopped

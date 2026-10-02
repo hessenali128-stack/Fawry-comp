@@ -10,11 +10,12 @@ from typing import Literal
 
 import numpy as np
 import redis
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from api import config as cfg
 from api.recommender import ModelManager, apply_event, recommend
+from common import geo
 from common.core import eligible_mask
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -137,6 +138,32 @@ def areas():
     active = int(eligible_mask(b.art, day, None).sum())
     return {"areas": b.areas, "mappable_from_location": sorted(b.area_centroids), "as_of": b.as_of_date(day),
             "as_of_mode": cfg.AS_OF_DATE, "active_offers": active, "total_offers": len(b.art.item_ids)}
+
+
+@app.get("/offers")
+def offers(area: str | None = None, category: str | None = None, q: str | None = None,
+           limit: int = Query(60, ge=1, le=200), offset: int = Query(0, ge=0)):
+    """Browse ALL currently active offers (same expiry/area filters as /recommendations), most popular first."""
+    b = mgr.bundle
+    if b is None:
+        raise HTTPException(503, "model not loaded")
+    a, day = b.art, b.as_of_day()
+    ar = b.area_index.get(geo.canonical(area)) if area else None
+    ids = np.where(eligible_mask(a, day, ar))[0]
+    ids = [int(i) for i in ids[np.argsort(-a.pop[ids])]]
+    cat_of = lambda i: a.macro_cats[a.offer_cat_idx[i]]
+    cats: dict = {}
+    for i in ids:
+        cats[cat_of(i)] = cats.get(cat_of(i), 0) + 1
+    if category:
+        ids = [i for i in ids if cat_of(i) == category]
+    if q:
+        ql = q.lower().strip()
+        ids = [i for i in ids if ql in (a.offer_meta[i]["partner"] + " " + a.offer_meta[i]["description"]).lower()]
+    page = ids[offset: offset + limit]
+    return {"total": len(ids), "as_of": b.as_of_date(day), "area": ar,
+            "categories": [{"name": k, "count": v} for k, v in sorted(cats.items(), key=lambda t: -t[1])],
+            "offers": [{"offer_id": str(a.item_ids[i]), "category": cat_of(i), **a.offer_meta[i]} for i in page]}
 
 
 @app.get("/internal/stats", include_in_schema=False)

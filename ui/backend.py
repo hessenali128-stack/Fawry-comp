@@ -50,3 +50,14 @@ def send_event(user_id: str, offer_id: str, event: str):
         return True, None
     except httpx.HTTPError as e:
         return False, _err(e)
+
+
+def offers(area=None, category=None, q=None, limit=60):
+    """All active offers (GET /offers) -> (data | None, error | None)"""
+    params = {k: v for k, v in {"area": area, "category": category, "q": q, "limit": limit}.items() if v}
+    try:
+        r = _client.get("/offers", params=params)
+        r.raise_for_status()
+        return r.json(), None
+    except httpx.HTTPError as e:
+        return None, _err(e)

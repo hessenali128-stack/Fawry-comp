@@ -1,192 +1,120 @@
 """
-app.py
-------
-Fawry-styled Gradio app wired to the recommendation backend (through Traefik).
+Fawry web app (Gradio shell + custom HTML UI, responsive phone / tablet / desktop).
 
-  Login / Sign up  -> the identifier becomes the user_id sent to the API
-  On page load     -> the browser asks for the device location (lat/lon); it is sent with each recommendation request
-                      and never stored. The Offers page also has a manual Area selector that overrides it.
-  Home / Offers    -> live POST /recommendations (expired and out-of-area offers are filtered server-side)
-  Offers buttons   -> POST /events (click / open / purchase / redemption), then fresh recommendations
+One bridge: every clickable element in views.py carries data-act; theme.HEAD_JS posts {a, v, fields, geo} into a hidden
+textbox and clicks a hidden button, and act() below runs the action and re-renders the page.
+  Accounts/wallet -> store.py (SQLite; existing customers seeded on first start, new sign-ups appended)
+  Recommendations -> POST /recommendations   All offers -> GET /offers   Interactions -> POST /events
 
-Run with:  python app.py      (env: API_BASE, PORT)
+Run:  python app.py      (env: API_BASE, PORT, DATA_DIR, DEMO_PASSWORD)
 """
+import json
 import os
-import re
 
 import gradio as gr
 
 import backend as B
-import components as C
-import pages as P
-from theme import CUSTOM_CSS, EXTRA_CSS
+import catalog
+import store
+import views as V
+from theme import CSS, HEAD_JS
 
-APP_PAGES = ["home", "wallet", "offers", "quickpay"]
-PAGE_KEYS = ["login", "signup", "home", "wallet", "offers", "quickpay", "nav"]
-MAX_SLOTS = 10
-N_VIEW = 4 + 2 * MAX_SLOTS  # session, for-you strip, model status, area dropdown, (column, html) per slot
+TOP_N = 10
 
-GEO_JS = """() => new Promise((resolve) => {
-  if (!navigator.geolocation) { resolve([null, null]); return; }
-  navigator.geolocation.getCurrentPosition(
-    (p) => resolve([p.coords.latitude, p.coords.longitude]),
-    () => resolve([null, null]),
-    { timeout: 10000, maximumAge: 300000 });
-})"""
+
+def refresh(st, recs=True):
+    """Reload user + wallet + whatever offers the current tab needs."""
+    u = store.get(st["user"]["user_id"]); st["user"], st["tx"] = u, store.tx(u["user_id"], 30)
+    if not st.get("areas"): st["areas"] = B.areas()
+    st["oerr"] = None
+    if st.get("tab") == "all":
+        st["govs"] = catalog.GOVS
+        st["all"] = catalog.search(st.get("q", ""), st.get("cat", ""), st.get("gov", ""), bool(st.get("active_only")), st.get("limit", 24))
+    elif recs:
+        geo = st.get("geo") or (None, None)
+        data, err = B.recommendations(u["user_id"], TOP_N, geo[0], geo[1], st.get("area"))
+        if data: st["recs"] = data["recommendations"]
+        st["oerr"] = err or (data or {}).get("warning")
+    return st
+
+
+def say(st, msg, err=False): st["msg"], st["err"] = msg, err
+
+
+def amount(f):
+    try:
+        x = float(str(f.get("amount", "")).replace(",", "").strip()); return x if 0 < x <= 100000 else None
+    except ValueError:
+        return None
+
+
+def act(payload, st):
+    st = dict(st or {"page": "login"}); st["msg"] = ""
+    try:
+        p = json.loads(payload)
+    except (TypeError, ValueError):
+        return V.render(st), st
+    a, v, f = p["a"], p.get("v", ""), p.get("f", {})
+    st["n"] = p.get("n", 0)
+    if p.get("geo"): st["geo"] = tuple(p["geo"])
+    u = st.get("user")
+
+    if a == "page": st["page"] = v
+    elif a == "login":
+        user, err = store.login(f.get("id", ""), f.get("pw", ""))
+        if err: say(st, err, True)
+        else: st.update(user=user, page="home", tab="rec", cat="", q="", area=None, gov="", limit=24, active_only=False); refresh(st); say(st, f"Welcome, {user['name'].split()[0]}!")
+    elif a == "signup":
+        user, err = store.signup(f.get("name", "") or "", f.get("phone", ""), f.get("email", ""), f.get("pw", ""))
+        if not f.get("name", "").strip(): user, err = None, "Please enter your full name."
+        if err: say(st, err, True)
+        else: st.update(user=user, page="home", tab="rec", cat="", q="", area=None, gov="", limit=24, active_only=False); refresh(st); say(st, f"Account created. Your customer ID is {user['user_id']}.")
+    elif not u: pass
+    elif a == "logout": st = {"page": "login"}; say(st, "Logged out.")
+    elif a == "go":
+        st["page"] = v
+        if v == "offers" and not st.get("tab"): st["tab"] = "rec"
+        refresh(st)
+    elif a == "tab": st.update(tab=v, limit=24); refresh(st)
+    elif a == "cat": st.update(cat=v, limit=24); refresh(st)
+    elif a == "gov": st.update(gov=v, limit=24); refresh(st)
+    elif a == "active": st.update(active_only=bool(v), limit=24); refresh(st)
+    elif a == "more": st["limit"] = st.get("limit", 24) + 24; refresh(st)
+    elif a == "search":
+        st.update(q=f.get("q", "").strip(), tab="all", page="offers", limit=24, cat=""); refresh(st)
+    elif a.startswith("ev:"):
+        ev = a[3:]
+        ok, err = B.send_event(u["user_id"], v, ev)
+        say(st, ("Offer opened." if ev == "open" else "Offer added to your account.") + (" Your picks are updated." if ok else "") if ok or ev == "open" else (err or "Could not save this offer right now."), not ok and ev != "open")
+        refresh(st, recs=True) if st.get("tab") != "all" else refresh(st)
+    elif a == "topup" or a == "amt":
+        x = float(v) if a == "amt" else amount(f)
+        if x is None: say(st, "Enter a valid amount.", True)
+        else: store.add_tx(u["user_id"], "Wallet top-up", "topup", x); refresh(st, False); say(st, f"EGP {x:,.2f} added to your wallet.")
+    elif a == "card":
+        store.request_card(u["user_id"]); refresh(st, False); say(st, "Yellow Card requested - free delivery is on its way.")
+    elif a == "pay": st["page"], st["biller"] = "quickpay", v; refresh(st, False)
+    elif a == "dopay":
+        x = amount(f)
+        if not f.get("acct", "").strip(): say(st, "Enter the account / meter / mobile number.", True)
+        elif x is None: say(st, "Enter a valid amount.", True)
+        else:
+            kind = {"Water": "water", "Internet": "internet", "Top-up": "recharge"}.get(st["biller"], "bill")
+            ok, err = store.add_tx(u["user_id"], f"{st['biller']} payment", kind, -x)
+            refresh(st, False); say(st, f"Paid EGP {x:,.2f} for {st['biller']}." if ok else err, not ok)
+    elif a == "toast": say(st, v)
+    return V.render(st), st
 
 
 def build_app():
-    with gr.Blocks(css=CUSTOM_CSS + EXTRA_CSS, title="Fawry", theme=gr.themes.Base()) as demo:
-        user_name = gr.State("Ahmed Mohamed")
-        session = gr.State({"user_id": None, "recs": [], "lat": None, "lon": None, "area": None})
-        geo_lat = gr.Number(elem_classes="fw-hidden", show_label=False)
-        geo_lon = gr.Number(elem_classes="fw-hidden", show_label=False)
-
-        with gr.Column(elem_id="fw-shell"):
-            login = P.build_login_page()
-            signup = P.build_signup_page()
-
-            home = P.build_home_page()
-            wallet = P.build_wallet_page()
-            offers = P.build_offers_page(max_slots=MAX_SLOTS)
-            quickpay = P.build_quickpay_page()
-
-            nav_row, nav_buttons = C.bottom_nav(active="home", visible=False)
-
-        all_page_cols = {
-            "login": login["col"], "signup": signup["col"],
-            "home": home["col"], "wallet": wallet["col"],
-            "offers": offers["col"], "quickpay": quickpay["col"],
-        }
-        slots = offers["slots"]
-        view_outputs = [session, home["for_you_html"], offers["model_status"], offers["area_dd"],
-                        *[c for s in slots for c in (s["col"], s["html"])]]
-
-        demo.load(None, None, [geo_lat, geo_lon], js=GEO_JS)
-
-        # ---- helpers -------------------------------------------------
-        def goto(target):
-            updates = {key: gr.update(visible=(key == target)) for key in all_page_cols}
-            updates["nav"] = gr.update(visible=(target in APP_PAGES))
-            return updates
-
-        def display_name(identifier):
-            ident = identifier.strip()
-            local_part = ident.split("@")[0] if "@" in ident else ident
-            cleaned = local_part.replace(".", " ").replace("_", " ").replace("-", " ").strip()
-            return cleaned.title() if cleaned else "Fawry User"
-
-        def signup_user_id(phone, email):
-            digits = re.sub(r"\D", "", phone)
-            return f"USER_{digits}" if digits else "USER_" + re.sub(r"[^a-z0-9]+", "_", email.lower()).strip("_")
-
-        def make_router(target):
-            def _router(*_args):
-                upd = goto(target)
-                return [upd[k] for k in PAGE_KEYS]
-            return _router
-
-        outputs = [login["col"], signup["col"], home["col"],
-                   wallet["col"], offers["col"], quickpay["col"], nav_row]
-
-        # ---- live recommendations -----------------------------------------
-        def view_updates(sess, data, err, area_choices=None):
-            recs = sess["recs"]
-            area_upd = (gr.update(choices=["Auto", *area_choices], value=sess["area"] or "Auto")
-                        if area_choices is not None else gr.update())
-            upd = [sess,
-                   gr.update(value=C.rec_cards_html(recs) if recs else C.empty_recs_html("No recommendations to show.")),
-                   gr.update(value=C.status_line(data, err)), area_upd]
-            for i in range(MAX_SLOTS):
-                if i < len(recs):
-                    upd += [gr.update(visible=True), gr.update(value=C.rec_card_html(recs[i]))]
-                else:
-                    upd += [gr.update(visible=False), gr.update(value="")]
-            return upd
-
-        def fetch(sess, area_choices=None):
-            if not sess.get("user_id"):
-                return view_updates(sess, None, "Please log in first.")
-            data, err = B.recommendations(sess["user_id"], MAX_SLOTS, sess["lat"], sess["lon"], sess["area"])
-            if data:
-                sess["recs"] = data["recommendations"]
-            return view_updates(sess, data, err, area_choices)
-
-        def new_session(user_id, lat, lon):
-            return {"user_id": user_id, "recs": [], "lat": lat, "lon": lon, "area": None}
-
-        # ---- auth flow -------------------------------------------------
-        def do_login(identifier, password, lat, lon, sess):
-            ok = bool(identifier and password)
-            if not ok:
-                upd = goto("login")
-                return ["⚠️ Please enter your customer ID / email / phone and password.",
-                        *[upd[k] for k in PAGE_KEYS], gr.skip(), gr.skip(), *[gr.skip()] * N_VIEW]
-            sess = new_session(identifier.strip(), lat, lon)
-            name = display_name(identifier)
-            upd = goto("home")
-            return ["✅ Logged in! Redirecting...", *[upd[k] for k in PAGE_KEYS],
-                    gr.update(value=C.app_header_html(name=name)), name, *fetch(sess, B.areas())]
-
-        def do_signup(name, phone, email, password, lat, lon, sess):
-            ok = all([name, phone, email, password])
-            if not ok:
-                upd = goto("signup")
-                return ["⚠️ Please fill in every field.",
-                        *[upd[k] for k in PAGE_KEYS], gr.skip(), gr.skip(), *[gr.skip()] * N_VIEW]
-            uid = signup_user_id(phone, email)
-            sess = new_session(uid, lat, lon)
-            upd = goto("home")
-            return [f"✅ Account created! Your customer ID is {uid}. Redirecting...", *[upd[k] for k in PAGE_KEYS],
-                    gr.update(value=C.app_header_html(name=name)), name, *fetch(sess, B.areas())]
-
-        login["login_btn"].click(
-            do_login, inputs=[login["email"], login["password"], geo_lat, geo_lon, session],
-            outputs=[login["status"], *outputs, home["header_html"], user_name, *view_outputs], api_name="login")
-        signup["signup_btn"].click(
-            do_signup, inputs=[signup["name"], signup["phone"], signup["email"], signup["password"],
-                               geo_lat, geo_lon, session],
-            outputs=[signup["status"], *outputs, home["header_html"], user_name, *view_outputs], api_name="signup")
-        login["to_signup_btn"].click(make_router("signup"), outputs=outputs)
-        signup["to_login_btn"].click(make_router("login"), outputs=outputs)
-
-        # ---- offer interactions -> POST /events ----------------------------
-        def make_event_handler(i, event):
-            def _handler(sess):
-                recs = sess.get("recs", [])
-                if i >= len(recs):
-                    return ["", *fetch(sess)]
-                rec = recs[i]
-                ok, err = B.send_event(sess["user_id"], rec["offer_id"], event)
-                msg = f"✅ **{event}** sent for `{rec['offer_id']}` - recommendations refreshed." if ok else f"⚠️ {err}"
-                return [msg, *fetch(sess)]
-            return _handler
-
-        event_outputs = [offers["event_status"], *view_outputs]
-        for i, slot in enumerate(slots):
-            for event, btn in slot["buttons"].items():
-                btn.click(make_event_handler(i, event), inputs=[session], outputs=event_outputs,
-                          api_name=f"ev_{i}_{event}")
-        offers["refresh_btn"].click(lambda sess: ["", *fetch(sess)], inputs=[session], outputs=event_outputs,
-                                    api_name="refresh")
-
-        def on_area(choice, sess):
-            sess["area"] = None if choice in (None, "Auto") else choice
-            return ["", *fetch(sess)]
-
-        offers["area_dd"].input(on_area, inputs=[offers["area_dd"], session], outputs=event_outputs, api_name="area")
-
-        # ---- bottom nav routing -----------------------------------------
-        nav_buttons["home"].click(make_router("home"), outputs=outputs)
-        nav_buttons["wallet"].click(make_router("wallet"), outputs=outputs)
-        nav_buttons["offers"].click(make_router("offers"), outputs=outputs)
-        nav_buttons["quickpay"].click(make_router("quickpay"), outputs=outputs)
-        nav_buttons["more"].click(make_router("wallet"), outputs=outputs)  # demo fallback
-
-        # ---- header shortcut buttons -------------------------------------
-        home["top_up_btn"].click(make_router("wallet"), outputs=outputs)
-        wallet["add_money_btn"].click(make_router("wallet"), outputs=outputs)
-
+    with gr.Blocks(css=CSS, head=HEAD_JS + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">',
+                   title="Fawry", theme=gr.themes.Base()) as demo:
+        st = gr.State({"page": "login"})
+        view = gr.HTML(V.render({"page": "login"}), elem_id="fw-root")
+        with gr.Group(elem_id="fw-bridge"):
+            box = gr.Textbox(elem_id="fw-act", show_label=False)
+            go = gr.Button("go", elem_id="fw-go")
+        go.click(act, [box, st], [view, st], api_name="act", show_progress="hidden")
     return demo
 
 
