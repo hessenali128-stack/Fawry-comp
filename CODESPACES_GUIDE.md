@@ -94,8 +94,8 @@ inside the Codespace and are not committed.
 ls -lh data
 ```
 
-If `data/` is empty, training **generates a synthetic dataset** with the same schema so everything still runs; it logs a
-warning. Never judge model quality from a synthetic run.
+The project **never generates data**. If a file is missing, `training` logs `missing in /app/data/: …` and retries every 30 s,
+so you can upload the CSVs after `docker compose up`. Offers, users and interactions come only from these files.
 
 ### 2.4 Start everything
 
@@ -131,7 +131,7 @@ Ports are **private** by default, which means only you (logged into GitHub) can 
 ```bash
 curl -s localhost:8000/ready
 curl -s -X POST localhost:8000/recommendations -H 'content-type: application/json' \
-     -d '{"user_id":"CUST_0007","top_n":5}' | python -m json.tool
+     -d '{"user_id":"<USER_ID>","top_n":5}' | python -m json.tool
 ```
 
 Get real user and offer ids from your data:
@@ -152,8 +152,12 @@ Unknown user ids are accepted and served as cold users.
 
 ### 3.1 The UI (port 7860)
 
-* **Log in** with a customer id from your data (for example `CUST_0007`) and any non-empty password (the original demo
-  has no real authentication).
+* **Log in** with a customer id from your data and any non-empty password (the original demo has no real authentication).
+* When the page opens the **browser asks for your location** (allow it; a Codespaces forwarded URL is HTTPS). It is sent with each
+  recommendation request only to choose the area; it is not stored. The **Area** selector on *Offers* overrides it
+  (`Auto` = device location, then your profile governorate). The status line shows the area and where it came from.
+* Offers that are expired or not available in the current area never appear. After you click an offer, the three offers most
+  similar to it are pinned on top with the badge *Similar to your last click*.
 * **Sign up** creates a *cold-start* user `USER_<your phone digits>`: watch the recommendations start generic and adapt as
   you interact.
 * **Home → For you** shows the first 6 recommendations; **Offers** shows 10 with rank and *Top pick / Explore* badges.
@@ -174,13 +178,13 @@ docker compose exec redis redis-cli ping
 docker compose exec redis redis-cli
 ```
 
-Inside `redis-cli` (after you clicked around in the UI as `CUST_0007`):
+Inside `redis-cli` (after you clicked around in the UI as `<USER_ID>`):
 
 ```
 KEYS user:*                              # live state hashes
-HGETALL user:CUST_0007                   # cat:*, partner:*, gt:*, offer:*, counters, last_event
+HGETALL user:<USER_ID>                   # cat:*, partner:*, gt:*, offer:*, counters, last_event
 KEYS recommendations:*                   # cached slates (30 s TTL)
-TTL recommendations:CUST_0007            # seconds left, -2 = expired/deleted (an event deletes it)
+TTL recommendations:<USER_ID>            # seconds left, -2 = expired/deleted (an event deletes it)
 XLEN events:stream                       # events waiting or kept in the stream
 XINFO GROUPS events:stream               # consumer group: pending (unacked) and lag
 XPENDING events:stream event-workers     # unacked messages summary
@@ -217,7 +221,7 @@ docker compose logs -f event-worker
 ```bash
 docker compose stop event-worker
 for i in 1 2 3 4 5; do curl -s -X POST localhost:8000/events -H 'content-type: application/json' \
-  -d '{"user_id":"CUST_0007","offer_id":"OFFER_0001","event":"click"}' >/dev/null; done
+  -d '{"user_id":"<USER_ID>","offer_id":"<OFFER_ID>","event":"click"}' >/dev/null; done
 docker compose exec redis redis-cli XLEN events:stream          # grew
 docker compose exec postgres psql -U fawry -d fawry -c "select count(*) from events"   # unchanged
 docker compose start event-worker
@@ -237,7 +241,7 @@ curl -s localhost:8000/ready
 curl -s localhost:8000/model | python -m json.tool      # version, the 17 features, NDCG@10
 
 curl -s -X POST localhost:8000/events -H 'content-type: application/json' \
-     -d '{"user_id":"CUST_0007","offer_id":"OFFER_0868","event":"purchase"}'
+     -d '{"user_id":"<USER_ID>","offer_id":"<OFFER_ID>","event":"purchase"}'
 ```
 
 `event` must be one of `click`, `open`, `purchase`, `redemption`; anything else returns `422`.
@@ -258,7 +262,7 @@ docker compose ps api                                   # wait until all 3 are h
 
 for i in $(seq 1 12); do
   curl -s -i -X POST localhost:8000/recommendations -H 'content-type: application/json' \
-       -d "{\"user_id\":\"CUST_$(printf %04d $i)\",\"top_n\":3}" | grep -i '^x-served-by'
+       -d "{\"user_id\":\"lb-test-$i\",\"top_n\":3}" | grep -i '^x-served-by'
 done | sort | uniq -c                                   # requests spread over 3 different ids
 
 docker ps --format '{{.ID}}  {{.Names}}' | grep api     # map ids to container names
@@ -393,9 +397,64 @@ With one replica, find the highest RPS where p95 is still acceptable and errors 
 `TARGET_RPS_PER_REPLICA` in `docker-compose.yml` and `docker compose up -d autoscaler`.
 
 Reference point (not a promise about your machine): on a 1-CPU test box that also ran Redis, PostgreSQL, the worker and
-the load generator, one API process handled 200 RPS with p95 ≈ 5 ms on the synthetic sample data (1,328 offers,
-3,000 users). Real data and other hardware will differ, and the design has known limits at very large user counts
+the load generator, one API process handled 200 RPS with p95 ≈ 5 ms on a development sample (1,328 offers,
+3,000 users; not your data). Real data and other hardware will differ, and the design has known limits at very large user counts
 (see the README's *Known limitations*).
+
+### 3.11 Check for future information in the training history
+
+Training builds each user's profile from all their other interactions (leave-one-out), including ones that happened *after* the
+target; serving only has past events. This read-only script measures how much that matters on your data:
+
+```bash
+docker compose exec training python scripts/leakage_check.py --data data            # data only: how many queries see future rows
+docker compose exec training python scripts/leakage_check.py --data data --model    # also scores the published model with both history windows
+```
+
+Natively: `python scripts/leakage_check.py --data data --model`. Day granularity only (`days_since_first_event`).
+
+### 3.12 Expiry filter, location and "similar to your click"
+
+Serving only (training is unchanged). After Stage-1 retrieval and before the reranker the API keeps only offers that are
+**active on the as-of date** and **available in the user's area**; the area comes from the request (`area`, or `lat` + `lon`
+matched to the nearest area in your data), otherwise from the user's profile governorate. If too few candidates survive, the
+pool is topped up from eligible offers only. The offer of the user's latest event (within 24 h) is the anchor: the 3 eligible
+offers most similar to it are pinned on top.
+
+```bash
+curl -s localhost:8000/areas | python -m json.tool          # areas in your data, as-of date, how many offers are active today
+
+# where the user is now: an area name from /areas, or lat + lon together
+curl -s -X POST localhost:8000/recommendations -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","top_n":5,"area":"<AREA>"}' | python -m json.tool
+curl -s -X POST localhost:8000/recommendations -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","top_n":5,"lat":31.2,"lon":29.95}' | python -m json.tool
+```
+
+The response contains `area` (`name` and `source`: request / location / profile / none), `as_of`, `anchor_offer_id` and a
+`warning` when something needs attention. Try the pinning:
+
+```bash
+# 1) slate  2) click one offer  3) slate again: the 3 offers most similar to the clicked one are pinned on top ("source": "similar")
+curl -s -X POST localhost:8000/recommendations -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","top_n":10}' | python -m json.tool | grep -E '"offer_id"|"source"'
+curl -s -X POST localhost:8000/events -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","offer_id":"<OFFER_ID>","event":"click"}'
+curl -s -X POST localhost:8000/recommendations -H 'content-type: application/json' \
+     -d '{"user_id":"<USER_ID>","top_n":10}' | python -m json.tool | grep -E '"offer_id"|"source"|anchor'
+```
+
+The as-of date defaults to **today**. If your offer files are historical, everything is expired and the API answers with an empty
+list and a warning (it never returns expired offers). Change the reference date with `AS_OF_DATE`:
+
+```bash
+# in docker-compose.yml (api service) set  AS_OF_DATE: dataset   (or a fixed date such as 2025-06-30), then recreate:
+docker compose up -d --force-recreate api
+curl -s localhost:8000/areas | python -m json.tool | grep -E 'as_of|active_offers'
+```
+
+Other knobs on the `api` service: `MIN_POOL` (50), `MAX_AREA_KM` (250), `SIMILAR_PIN` (3; 0 disables pinning), `SIMILAR_POOL` (15),
+`ANCHOR_MAX_AGE_SECONDS` (86400). Details and limits: README, *Serving filters, location and "similar to your click"*.
 
 ---
 
@@ -443,7 +502,7 @@ There is no Traefik or autoscaler in this mode; those are the Docker-only parts.
 Inspecting Redis and PostgreSQL natively:
 
 ```bash
-redis-cli HGETALL user:CUST_0007
+redis-cli HGETALL user:<USER_ID>
 PGPASSWORD=fawry psql -h localhost -U fawry -d fawry -c "select count(*) from events"
 ```
 
@@ -472,7 +531,9 @@ rm -rf models/v* models/current.json     # force a fresh bootstrap training (run
 |---|---|---|
 | `/ready` = 503, UI says "not ready" | No model yet, or API can't reach Redis | `docker compose logs training` (wait for `READY`); `docker compose ps redis` |
 | Training container exits / "Killed", exit code 137 | Out of memory while building the query table | Use a bigger Codespace machine; `docker stats`; for very large data chunk the table (see README limitations) |
-| `training` logs "generating synthetic data" | `data/` has no CSVs | Upload the 3 CSVs to `data/`, delete `models/v*` and `models/current.json` (via container/sudo), `docker compose restart training` |
+| `training` logs `missing in /app/data/: …` | The CSVs are not in `data/` yet | Upload the 3 CSVs to `data/`; training retries every 30 s by itself |
+| Empty recommendations and a warning "No active offers as of …" | Every offer has expired relative to `AS_OF_DATE` (default: today) | Set `AS_OF_DATE: dataset` or a fixed date in `docker-compose.yml`, recreate `api` (see 3.12) |
+| The area shown is the wrong governorate | Location → area uses approximate centroids (fuzzy near borders such as Cairo/Giza) | Pick the right area in the **Area** selector, or send `area` in the API request |
 | Traefik returns `404 page not found` | No healthy API container yet | `docker compose ps api` (status must be *healthy*); `docker compose logs api` |
 | UI shows "Cannot reach the recommendation backend" | Traefik or API down | `docker compose ps`; `curl localhost:8000/ready` inside the Codespace |
 | UI page blank or stuck loading in the browser | Opened the wrong URL or an old tab | Open port 7860 from the PORTS tab, hard-refresh; check `docker compose logs ui` |
