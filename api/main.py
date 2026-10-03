@@ -123,9 +123,9 @@ def model():
         raise HTTPException(503, "model not loaded")
     m = b.meta["metrics"]
     return {"version": b.version, "loaded_at": b.loaded_at, "n_features": len(b.cols), "features": b.cols,
-            "created_at": b.meta["created_at"],
-            "ndcg@10": {"34_features_val": m["val_34"]["ndcg@10"], "17_features_val": m["val_17"]["ndcg@10"],
-                        "17_features_test": m["test_17"]["ndcg@10"]},
+            "contract": b.meta.get("contract"), "created_at": b.meta["created_at"],
+            "ndcg@10": {"17_features_val": m["val_17"]["ndcg@10"], "17_features_test": m["test_17"]["ndcg@10"],
+                        "popularity_val": m.get("popularity_val"), "popularity_test": m.get("popularity_test")},
             "load_error": mgr.last_error, "rejected_version": mgr.failed}
 
 
