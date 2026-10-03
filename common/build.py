@@ -8,7 +8,8 @@ from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-from common.core import Artifacts, normalize_arabic, sanitize
+from common import config as C
+from common.core import CONTRACT, FLAG_COLS, Artifacts, fit_score_table, normalize_arabic, order_frame, sanitize
 
 MERCHANT_TO_MACRO = {
     "accounting": "services", "admin_payments": "services", "advertising_services": "services",
@@ -38,8 +39,9 @@ MERCHANT_TO_MACRO = {
 
 def load_raw(data_dir: str):
     d = Path(data_dir)
-    return (pd.read_csv(d / "user_features.csv"), pd.read_csv(d / "train_interactions.csv"),
-            pd.read_csv(d / "offer_features.csv"))
+    ti = pd.read_csv(d / "train_interactions.csv")
+    ti["_pos"] = np.arange(len(ti))  # CSV position: the only intra-day order the dataset has (see core.order_frame)
+    return pd.read_csv(d / "user_features.csv"), ti, pd.read_csv(d / "offer_features.csv")
 
 
 def prepare_offers(offers: pd.DataFrame) -> pd.DataFrame:
@@ -67,8 +69,12 @@ def spend_matrix(users: pd.DataFrame, macro_cats: list) -> np.ndarray:
     return out
 
 
-def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
-    """Fit every retrieval index on `train_users` only (notebook §2.0-2.1)."""
+def build_artifacts(users_raw, ti, offers_raw, train_users: set, score_table: dict | None = None,
+                    split_of: dict | None = None) -> Artifacts:
+    """Fit every retrieval index on `train_users` only (notebook §2.0-2.1).
+    score_table (flag combo -> mean score) is fitted on the interaction rows if not supplied.
+    `ti` may carry production rows (column _src == 1); they feed the population statistics and the users' stored history
+    but never define the dataset's last day (eval_day)."""
     offers = prepare_offers(offers_raw)
     item_ids = offers["offer_id"].to_numpy()
     item_index = {o: i for i, o in enumerate(item_ids)}
@@ -111,10 +117,11 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
                    "gov": str(r.offer_gov_primary), "ends": str(r.gift_end_date)}
                   for r in offers.itertuples()]
 
-    anchor = pd.to_datetime(offers["gift_start_date"]).min()
+    anchor = pd.Timestamp(C.DAY0_DATE) if C.DAY0_DATE else pd.to_datetime(offers["gift_start_date"]).min()
     start_day = (pd.to_datetime(offers["gift_start_date"]) - anchor).dt.days.to_numpy()
     end_day = (pd.to_datetime(offers["gift_end_date"]) - anchor).dt.days.to_numpy()
-    eval_day = int(ti["days_since_first_event"].max())
+    ds_rows = ti[ti["_src"].fillna(0).astype(int) == 0] if "_src" in ti else ti
+    eval_day = int(ds_rows["days_since_first_event"].max())
 
     # TF-IDF on cleaned description (notebook §1.7a)
     tf = TfidfVectorizer(max_features=2500, ngram_range=(1, 2))
@@ -126,7 +133,8 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
     spend_norm = normalize(np.log1p(spend_amt), axis=1)
     affluence = np.log1p(spend_amt.sum(axis=1)) + 1.0
     total_spend = spend_amt.sum(axis=1).astype(np.float32)
-    top_cat_idx = spend_amt.argmax(axis=1)
+    # a user with no spend has NO top category (-1); argmax would silently pick category 0 for them
+    top_cat_idx = np.where(spend_amt.sum(axis=1) > 0, spend_amt.argmax(axis=1), -1)
     open_cols = sorted(c for c in users_raw.columns if c.endswith("_offer_open_cnt_30d"))
     purch_cols = sorted(c for c in users_raw.columns if c.endswith("_offer_purchase_cnt_30d"))
     raw_open = users_raw[open_cols].sum(axis=1).to_numpy()
@@ -142,7 +150,7 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
             "gov": govs[i], "gov_tag": gov_tag_idx.get(govs[i], -1), "cell": cells[i],
             "spend_amt": spend_amt[i].astype(np.float32), "spend_norm": spend_norm[i].astype(np.float32),
             "affluence": float(affluence[i]), "total_spend": float(total_spend[i]),
-            "top_cat_idx": int(top_cat_idx[i]), "top_cat": macro_cats[int(top_cat_idx[i])],
+            "top_cat_idx": int(top_cat_idx[i]), "top_cat": macro_cats[int(top_cat_idx[i])] if top_cat_idx[i] >= 0 else "",
             "flags": flags[i].tolist(), "raw_open": float(raw_open[i]), "raw_purch": float(raw_purch[i]),
         }
 
@@ -156,6 +164,7 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
     cooc = (ui.T @ ui).astype(np.float32)
     norms = np.sqrt(cooc.diagonal())
     norms[norms == 0] = 1.0
+    item_diag = np.asarray(cooc.diagonal(), dtype=np.float32).copy()
     sim = (sparse.diags(1.0 / norms) @ cooc @ sparse.diags(1.0 / norms)).tocsr()
     sim.setdiag(0.0)
     sim.eliminate_zeros()
@@ -182,6 +191,19 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
     bank_norm = normalize(bank_raw, axis=1)
     bank_items = [user_items.get(u, np.array([], dtype=int)) for u in tr_users]
 
+    # past interactions of dataset users, so a warm user is warm at serving time too (same rows the trainer sees)
+    if score_table is None:
+        score_table = fit_score_table(ti)
+    user_hist = {}  # rows in CHRONOLOGICAL order (core.order_frame): the last one is the user's latest interaction
+    h = order_frame(ti[ti["offer_id"].isin(item_index) & ti["user_id"].isin(set(users_raw["user_id"]))])
+    for u, g in h.groupby("user_id", sort=False):
+        user_hist[u] = {
+            "items": g["offer_id"].map(item_index).to_numpy(np.int32),
+            "flags": g[list(FLAG_COLS)].gt(0).to_numpy(np.uint8),
+            "count": g["interaction_count"].to_numpy(np.float32),
+            "score": g["score"].to_numpy(np.float32),
+        }
+
     onehot = pd.get_dummies(offers["cat_san"]).reindex(columns=macro_cats, fill_value=0).to_numpy(np.float32)
 
     return Artifacts(
@@ -198,6 +220,8 @@ def build_artifacts(users_raw, ti, offers_raw, train_users: set) -> Artifacts:
         govset_top=govset_top, cat_top=cat_top, nationwide_top=nationwide_top, partner_top=partner_top,
         demo_cell_cnt=demo_cnt, bank_norm=bank_norm, bank_items=bank_items,
         user_ids=list(users_raw["user_id"]), user_static=user_static,
+        score_table=score_table, user_hist=user_hist, item_cooc=cooc.tocsr(), item_diag=item_diag,
+        contract=CONTRACT, split_of=dict(split_of or {}),
     )
 
 
