@@ -10,7 +10,7 @@ OFFERS = []
 # accepts the slim offers.csv AND the raw data/offer_features.csv (so a wrong copy cannot crash the UI)
 _MAP = {"partner": "offer_partner_en", "category": "offer_category", "description": "gift_description", "start": "gift_start_date",
         "end": "gift_end_date", "price": "gift_customer_price", "type": "offer_type", "gov": "offer_gov_primary",
-        "area": "offer_area_primary", "dtype": "offer_discount_type", "dvalue": "offer_discount_value", "cash": "offer_cash_amount",
+        "govset": "offer_gov_set", "area": "offer_area_primary", "dtype": "offer_discount_type", "dvalue": "offer_discount_value", "cash": "offer_cash_amount",
         "pop": "popularity"}
 _SRC = _PATH if _PATH.exists() else Path(__file__).parent.parent / "data" / "offer_features.csv"
 if _SRC.exists():
@@ -19,13 +19,20 @@ if _SRC.exists():
         for k, alt in _MAP.items():
             r[k] = (raw.get(k) if raw.get(k) is not None else raw.get(alt)) or ""
         r["start"], r["end"] = r["start"][:10], r["end"][:10]
+        # governorates the offer is really valid in: primary + the offer_gov_set (same rule as the backend's expanded_geo)
+        r["govs"] = sorted({g.strip() for g in ([r["gov"]] + r["govset"].split("|")) if g.strip() and g.strip().upper() != "NATIONWIDE"})
         r["category"] = r["category"].strip()
         for k in ("price", "pop", "dvalue", "cash"):
             try: r[k] = float(r[k] or 0)
             except ValueError: r[k] = 0.0
         r["hay"] = " ".join(str(r[k]) for k in ("offer_id", "partner", "category", "description", "type", "gov", "area")).lower().replace("_", " ")
         if r["offer_id"]: OFFERS.append(r)
-GOVS = sorted({o["gov"] for o in OFFERS if o["gov"] and o["gov"].upper() != "NATIONWIDE"})
+GOVS = sorted({g for o in OFFERS for g in o["govs"]})
+
+
+def in_area(o, gov):
+    """Offer is available in `gov`: nationwide, or its primary governorate / governorate set contains it."""
+    return not gov or o["gov"].upper() == "NATIONWIDE" or gov.lower() in {g.lower() for g in o["govs"]}
 
 
 def today():
@@ -40,7 +47,7 @@ def search(q="", category="", gov="", active_only=False, limit=24):
     t = today()
     toks = [w for w in re.split(r"\s+", (q or "").lower().strip()) if w]
     base = [o for o in OFFERS if all(w in o["hay"] for w in toks)
-            and (not gov or o["gov"].upper() == "NATIONWIDE" or o["gov"] == gov)
+            and in_area(o, gov)
             and (not active_only or o["end"] >= t)]
     cats = {}
     for o in base:
