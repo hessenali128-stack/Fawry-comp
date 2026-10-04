@@ -68,7 +68,8 @@ def offer_card(o, i, badge=""):
     else: disc = ""
     badges = "".join(f'<span class="badge {c}">{e(t)}</span>' for t, c in ((badge, ""), (disc, ""), ("Expired" if expired else "", "x")) if t)
     where = o.get("gov") or ""
-    where = "" if where.upper() == "NATIONWIDE" else f" · {where}"
+    extra = len([g for g in (o.get("govs") or []) if g.lower() != where.lower()])  # other governorates it is valid in
+    where = "" if where.upper() == "NATIONWIDE" else f" · {where}" + (f" +{extra} more" if extra else "")
     btn = '<a class="btn o" style="opacity:.5;pointer-events:none">Expired</a>' if expired else f'<a class="btn" {act("ev:purchase", o["offer_id"])}>Get offer</a>'
     return f"""<div class="of {'xp' if expired else ''}"><div class="bgs">{badges}</div><div class="row"><div class="ic c1">{CAT_IC.get(cat, '🎁')}</div>
 <div><h4 dir="auto">{e((o.get('description') or o.get('partner') or o['offer_id'])[:110])}</h4><div class="meta" dir="auto">{e(o.get('partner') or '')} · {e(cat)}{price}{e(where)}</div></div></div>
